@@ -75,6 +75,9 @@ class Grant_Insight_JGrants_Importer_Improved {
         // WordPressの初期化が完了してからコンポーネントを初期化
         add_action('init', array($this, 'init_components'));
         
+        // 改良プロンプト更新用のアクションフック
+        add_action('admin_post_giji_improved_update_prompts', array($this, 'force_update_prompts'));
+        
         // 管理画面の初期化
         if (is_admin()) {
             add_action('admin_init', array($this, 'init_admin'));
@@ -185,6 +188,12 @@ class Grant_Insight_JGrants_Importer_Improved {
         $acf_file = GIJI_IMPROVED_PLUGIN_DIR . 'acf-fields-improved.php';
         if (file_exists($acf_file)) {
             require_once $acf_file;
+        }
+        
+        // 改良プロンプトの読み込み
+        $improved_prompts_file = GIJI_IMPROVED_PLUGIN_DIR . 'improved-prompts.php';
+        if (file_exists($improved_prompts_file)) {
+            require_once $improved_prompts_file;
         }
     }
     
@@ -366,8 +375,34 @@ class Grant_Insight_JGrants_Importer_Improved {
      * デフォルトプロンプトテンプレートの保存
      */
     private function save_default_prompts() {
-        $default_prompts = array(
-            'content_prompt' => "助成金情報を基に、わかりやすく魅力的な記事を作成してください。
+        // 改良プロンプトが利用可能な場合はそちらを使用
+        if (class_exists('GIJI_Improved_Prompts')) {
+            $enhanced_prompts = array(
+                'content_prompt' => GIJI_Improved_Prompts::get_enhanced_content_prompt(),
+                'excerpt_prompt' => GIJI_Improved_Prompts::get_enhanced_excerpt_prompt(),
+                'summary_prompt' => GIJI_Improved_Prompts::get_enhanced_summary_prompt(),
+                'keywords_prompt' => GIJI_Improved_Prompts::get_keywords_prompt(),
+                'target_audience_prompt' => GIJI_Improved_Prompts::get_target_audience_prompt(),
+                'application_tips_prompt' => GIJI_Improved_Prompts::get_application_tips_prompt(),
+                'requirements_prompt' => GIJI_Improved_Prompts::get_requirements_prompt(),
+                'organization_prompt' => GIJI_Improved_Prompts::get_organization_prompt(),
+                'difficulty_prompt' => GIJI_Improved_Prompts::get_difficulty_prompt(),
+                'success_rate_prompt' => GIJI_Improved_Prompts::get_success_rate_prompt(),
+            );
+            
+            foreach ($enhanced_prompts as $key => $prompt) {
+                // 既存のプロンプトがない場合、または強制更新フラグがある場合に更新
+                if (!get_option('giji_improved_' . $key) || get_option('giji_improved_force_update_prompts', false)) {
+                    update_option('giji_improved_' . $key, $prompt);
+                }
+            }
+            
+            // 強制更新フラグをリセット
+            delete_option('giji_improved_force_update_prompts');
+        } else {
+            // フォールバック: 基本的なプロンプト
+            $default_prompts = array(
+                'content_prompt' => "助成金情報を基に、わかりやすく魅力的な記事を作成してください。
 
 【助成金名】: [title]
 【概要】: [overview]
@@ -391,7 +426,7 @@ class Grant_Insight_JGrants_Importer_Improved {
 
 読者が申請を検討したくなるような、親しみやすい文章でお願いします。",
 
-            'excerpt_prompt' => "以下の助成金情報から、100文字程度の魅力的な抜粋を作成してください。
+                'excerpt_prompt' => "以下の助成金情報から、100文字程度の魅力的な抜粋を作成してください。
 
 【助成金名】: [title]
 【概要】: [overview]
@@ -399,7 +434,7 @@ class Grant_Insight_JGrants_Importer_Improved {
 
 読者が興味を持ち、詳細を読みたくなるような簡潔で魅力的な文章にしてください。",
 
-            'summary_prompt' => "以下の助成金情報を3行で要約してください。
+                'summary_prompt' => "以下の助成金情報を3行で要約してください。
 
 【助成金名】: [title]
 【概要】: [overview]
@@ -407,11 +442,12 @@ class Grant_Insight_JGrants_Importer_Improved {
 【募集終了日】: [deadline_text]
 
 各行は50文字程度で、要点を分かりやすくまとめてください。"
-        );
-        
-        foreach ($default_prompts as $key => $prompt) {
-            if (!get_option('giji_improved_' . $key)) {
-                update_option('giji_improved_' . $key, $prompt);
+            );
+            
+            foreach ($default_prompts as $key => $prompt) {
+                if (!get_option('giji_improved_' . $key)) {
+                    update_option('giji_improved_' . $key, $prompt);
+                }
             }
         }
     }
@@ -446,6 +482,31 @@ class Grant_Insight_JGrants_Importer_Improved {
     
     public function get_data_processor() {
         return $this->data_processor;
+    }
+    
+    /**
+     * 改良プロンプトの強制更新
+     */
+    public function force_update_prompts() {
+        if (!current_user_can('manage_options')) {
+            wp_die('権限がありません。');
+        }
+        
+        if (!wp_verify_nonce($_GET['_wpnonce'] ?? '', 'giji_improved_update_prompts')) {
+            wp_die('無効なリクエストです。');
+        }
+        
+        // 強制更新フラグを設定
+        update_option('giji_improved_force_update_prompts', true);
+        
+        // プロンプトを再設定
+        $this->save_default_prompts();
+        
+        $message = '改良プロンプトが正常に更新されました。';
+        
+        // 管理画面にリダイレクト
+        wp_redirect(admin_url('admin.php?page=giji-improved-prompts&message=' . urlencode($message)));
+        exit;
     }
 }
 

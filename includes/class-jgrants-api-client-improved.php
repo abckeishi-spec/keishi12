@@ -51,13 +51,18 @@ class GIJI_JGrants_API_Client {
             $params['per_page'] = $per_page;
         }
         
-        // 金額フィルターの追加
+        // 金額フィルターの追加（事前フィルタリング強化）
         if (isset($params['min_amount']) && $params['min_amount'] > 0) {
             $params['subsidy_max_limit_from'] = intval($params['min_amount']);
         }
         
         if (isset($params['max_amount']) && $params['max_amount'] > 0) {
             $params['subsidy_max_limit_to'] = intval($params['max_amount']);
+        }
+        
+        // 金額0円・不明データの事前除外
+        if (isset($params['exclude_zero_amount']) && $params['exclude_zero_amount']) {
+            $params['subsidy_max_limit_from'] = max(1, $params['subsidy_max_limit_from'] ?? 1);
         }
         
         // 地域フィルターの追加
@@ -110,6 +115,70 @@ class GIJI_JGrants_API_Client {
         $this->logger->log('JグランツAPI一覧取得成功: ' . count($response['result']) . '件');
         
         return $response;
+    }
+    
+    /**
+     * 指定件数を確実に取得するためのバッファリング取得
+     */
+    public function get_subsidies_with_guaranteed_count($params = array()) {
+        $target_count = intval($params['per_page'] ?? 10);
+        $buffer_multiplier = 2.0; // 2倍のバッファを取得
+        $max_api_calls = 3; // 最大API呼び出し回数
+        
+        $collected_subsidies = array();
+        $api_calls = 0;
+        $offset = 0;
+        
+        $this->logger->log("バッファリング取得開始: 目標件数={$target_count}件");
+        
+        while (count($collected_subsidies) < $target_count && $api_calls < $max_api_calls) {
+            $api_calls++;
+            
+            // バッファサイズを計算（必要件数の2倍、最大100件）
+            $buffer_size = min(100, ceil(($target_count - count($collected_subsidies)) * $buffer_multiplier));
+            $buffer_params = $params;
+            $buffer_params['per_page'] = $buffer_size;
+            $buffer_params['offset'] = $offset;
+            
+            $this->logger->log("API呼び出し{$api_calls}回目: バッファサイズ={$buffer_size}件, オフセット={$offset}");
+            
+            $response = $this->get_subsidies($buffer_params);
+            
+            if (is_wp_error($response)) {
+                $this->logger->log("バッファリング取得エラー: " . $response->get_error_message(), 'error');
+                break;
+            }
+            
+            if (empty($response['result']) || !is_array($response['result'])) {
+                $this->logger->log("APIからのデータが空です。取得終了。");
+                break;
+            }
+            
+            // 取得したデータを追加
+            foreach ($response['result'] as $subsidy) {
+                if (count($collected_subsidies) >= $target_count) {
+                    break;
+                }
+                $collected_subsidies[] = $subsidy;
+            }
+            
+            $offset += count($response['result']);
+            
+            // APIからのデータが期待より少ない場合は終了
+            if (count($response['result']) < $buffer_size) {
+                $this->logger->log("APIからの取得データが期待数より少ないため終了");
+                break;
+            }
+        }
+        
+        $final_count = count($collected_subsidies);
+        $this->logger->log("バッファリング取得完了: 最終取得件数={$final_count}件 (目標: {$target_count}件)");
+        
+        return array(
+            'result' => array_slice($collected_subsidies, 0, $target_count),
+            'total_count' => $final_count,
+            'api_calls' => $api_calls
+        );
     }
     
     /**

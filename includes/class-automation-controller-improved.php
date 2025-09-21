@@ -147,7 +147,7 @@ class GIJI_Automation_Controller {
     }
     
     /**
-     * 手動インポートの実行（改善版）
+     * 手動インポートの実行（改善版・バッファリング取得対応）
      */
     public function execute_manual_import($search_params = array(), $max_count = 5) {
         $this->logger->log('手動インポート開始: 最大' . $max_count . '件');
@@ -175,8 +175,8 @@ class GIJI_Automation_Controller {
             
             $this->logger->log('検索パラメータ: ' . wp_json_encode($search_params));
             
-            // 助成金一覧の取得
-            $response = $jgrants_client->get_subsidies($search_params);
+            // バッファリング取得を使用して指定件数を確実に取得
+            $response = $jgrants_client->get_subsidies_with_guaranteed_count($search_params);
             
             if (is_wp_error($response)) {
                 return array(
@@ -193,21 +193,24 @@ class GIJI_Automation_Controller {
                         'success' => 0,
                         'error' => 0,
                         'duplicate' => 0,
+                        'excluded' => 0,
                         'details' => array()
                     )
                 );
             }
             
-            // 詳細データの処理
-            $subsidies = array_slice($response['result'], 0, $max_count);
-            $results = $this->process_manual_import_batch($subsidies, $jgrants_client);
+            // 詳細データの処理（改善版）
+            $subsidies = $response['result'];
+            $results = $this->process_manual_import_batch_improved($subsidies, $jgrants_client, $max_count);
             
             // 成功メッセージの作成
             $message = sprintf(
-                '手動インポート完了: 成功=%d件, エラー=%d件, 重複=%d件',
+                '手動インポート完了: 成功=%d件, エラー=%d件, 重複=%d件, 除外=%d件 (API呼び出し=%d回)',
                 $results['success'],
                 $results['error'],
-                $results['duplicate']
+                $results['duplicate'],
+                $results['excluded'],
+                $response['api_calls'] ?? 1
             );
             
             return array(
@@ -223,6 +226,133 @@ class GIJI_Automation_Controller {
                 'message' => 'エラーが発生しました: ' . $e->getMessage()
             );
         }
+    }
+    
+    /**
+     * 手動インポートのバッチ処理（改善版）
+     */
+    private function process_manual_import_batch_improved($subsidies, $jgrants_client, $target_count) {
+        $results = array(
+            'success' => 0,
+            'error' => 0,
+            'duplicate' => 0,
+            'excluded' => 0,
+            'details' => array()
+        );
+        
+        $processed_count = 0;
+        $duplicate_ids = $this->get_existing_jgrants_ids(); // 事前に重複IDを取得
+        
+        foreach ($subsidies as $subsidy) {
+            if ($processed_count >= $target_count) {
+                break; // 目標件数に達したら終了
+            }
+            
+            try {
+                // 事前重複チェック（高速化）
+                if (in_array($subsidy['id'], $duplicate_ids)) {
+                    $results['duplicate']++;
+                    $results['details'][] = array(
+                        'id' => $subsidy['id'],
+                        'title' => isset($subsidy['title']) ? $subsidy['title'] : 'ID: ' . $subsidy['id'],
+                        'status' => 'duplicate',
+                        'message' => '既に登録済み（事前チェック）'
+                    );
+                    continue;
+                }
+                
+                // 詳細データの取得
+                $detail_response = $jgrants_client->get_subsidy_detail($subsidy['id']);
+                
+                if (is_wp_error($detail_response)) {
+                    $results['error']++;
+                    $results['details'][] = array(
+                        'id' => $subsidy['id'],
+                        'title' => isset($subsidy['title']) ? $subsidy['title'] : 'ID: ' . $subsidy['id'],
+                        'status' => 'error',
+                        'message' => $detail_response->get_error_message()
+                    );
+                    continue;
+                }
+                
+                if (isset($detail_response['result'][0])) {
+                    $detail_data = $detail_response['result'][0];
+                    
+                    // データの処理と保存
+                    $result = $this->data_processor->process_and_save_grant($detail_data);
+                    
+                    if (!is_wp_error($result)) {
+                        $results['success']++;
+                        $processed_count++;
+                        $results['details'][] = array(
+                            'id' => $detail_data['id'],
+                            'title' => $detail_data['title'],
+                            'status' => 'success',
+                            'post_id' => $result
+                        );
+                    } else {
+                        $error_code = $result->get_error_code();
+                        if ($error_code === 'duplicate_grant') {
+                            $results['duplicate']++;
+                            $results['details'][] = array(
+                                'id' => $detail_data['id'],
+                                'title' => $detail_data['title'],
+                                'status' => 'duplicate',
+                                'message' => '既に登録済み'
+                            );
+                        } elseif (in_array($error_code, ['invalid_amount', 'amount_too_low_minimum', 'no_amount_data', 'invalid_title', 'invalid_overview'])) {
+                            $results['excluded']++;
+                            $results['details'][] = array(
+                                'id' => $detail_data['id'],
+                                'title' => $detail_data['title'],
+                                'status' => 'excluded',
+                                'message' => $result->get_error_message()
+                            );
+                        } else {
+                            $results['error']++;
+                            $results['details'][] = array(
+                                'id' => $detail_data['id'],
+                                'title' => $detail_data['title'],
+                                'status' => 'error',
+                                'message' => $result->get_error_message()
+                            );
+                        }
+                    }
+                }
+                
+            } catch (Exception $e) {
+                $results['error']++;
+                $results['details'][] = array(
+                    'id' => $subsidy['id'],
+                    'title' => isset($subsidy['title']) ? $subsidy['title'] : 'ID: ' . $subsidy['id'],
+                    'status' => 'error',
+                    'message' => $e->getMessage()
+                );
+            }
+            
+            // API制限を考慮した待機
+            sleep(1);
+        }
+        
+        return $results;
+    }
+    
+    /**
+     * 既存のJグランツIDを効率的に取得
+     */
+    private function get_existing_jgrants_ids() {
+        global $wpdb;
+        
+        $ids = $wpdb->get_col("
+            SELECT meta_value 
+            FROM {$wpdb->postmeta} pm 
+            INNER JOIN {$wpdb->posts} p ON pm.post_id = p.ID 
+            WHERE pm.meta_key = 'jgrants_id' 
+            AND p.post_type = 'grant' 
+            AND p.post_status IN ('publish', 'draft', 'private')
+        ");
+        
+        return array_map('strval', $ids); // 文字列として統一
     }
     
     /**
@@ -310,32 +440,48 @@ class GIJI_Automation_Controller {
     public function execute_manual_publish($count) {
         $this->logger->log('手動公開開始: ' . $count . '件');
         
-        $draft_posts = get_posts(array(
-            'post_type' => 'grant',
-            'post_status' => 'draft',
-            'posts_per_page' => intval($count),
-            'orderby' => 'date',
-            'order' => 'ASC',
-            'fields' => 'ids'
-        ));
+        // 優先順位に基づく複合ソート条件で下書きを取得
+        $draft_posts = $this->get_prioritized_draft_posts(intval($count));
         
         $results = array(
             'success' => 0,
             'error' => 0,
+            'skipped' => 0,
             'details' => array()
         );
         
         if (empty($draft_posts)) {
+            $this->logger->log('公開対象の下書きがありません');
             return $results;
         }
         
-        foreach ($draft_posts as $post_id) {
+        foreach ($draft_posts as $post_data) {
+            $post_id = $post_data['ID'];
             $post = get_post($post_id);
             if (!$post) continue;
             
+            // 公開前の検証
+            $validation_result = $this->validate_post_for_publishing($post_id);
+            if (is_wp_error($validation_result)) {
+                $results['skipped']++;
+                $results['details'][] = array(
+                    'id' => $post_id,
+                    'title' => $post->post_title,
+                    'status' => 'skipped',
+                    'message' => $validation_result->get_error_message(),
+                    'deadline' => $post_data['deadline'] ?? 'なし',
+                    'priority_score' => $post_data['priority_score'] ?? 0
+                );
+                $this->logger->log('公開スキップ (ID: ' . $post_id . '): ' . $validation_result->get_error_message(), 'warning');
+                continue;
+            }
+            
+            // 公開処理
             $update_result = wp_update_post(array(
                 'ID' => $post_id,
-                'post_status' => 'publish'
+                'post_status' => 'publish',
+                'post_date' => current_time('mysql'), // 公開日時を現在に設定
+                'post_date_gmt' => current_time('mysql', 1)
             ), true);
             
             if (is_wp_error($update_result)) {
@@ -344,7 +490,9 @@ class GIJI_Automation_Controller {
                     'id' => $post_id,
                     'title' => $post->post_title,
                     'status' => 'error',
-                    'message' => $update_result->get_error_message()
+                    'message' => $update_result->get_error_message(),
+                    'deadline' => $post_data['deadline'] ?? 'なし',
+                    'priority_score' => $post_data['priority_score'] ?? 0
                 );
                 $this->logger->log('公開エラー (ID: ' . $post_id . '): ' . $update_result->get_error_message(), 'error');
             } else {
@@ -352,15 +500,139 @@ class GIJI_Automation_Controller {
                 $results['details'][] = array(
                     'id' => $post_id,
                     'title' => $post->post_title,
-                    'status' => 'success'
+                    'status' => 'success',
+                    'deadline' => $post_data['deadline'] ?? 'なし',
+                    'priority_score' => $post_data['priority_score'] ?? 0
                 );
-                $this->logger->log('公開成功: ' . $post->post_title);
+                $this->logger->log('公開成功: ' . $post->post_title . ' (優先度: ' . $post_data['priority_score'] . ')');
+                
+                // 公開後の処理
+                $this->post_publish_actions($post_id);
             }
         }
         
-        $this->logger->log('手動公開完了: 成功 ' . $results['success'] . '件、エラー ' . $results['error'] . '件');
+        $this->logger->log('手動公開完了: 成功 ' . $results['success'] . '件、エラー ' . $results['error'] . '件、スキップ ' . $results['skipped'] . '件');
         
         return $results;
+    }
+    
+    /**
+     * 優先順位に基づく下書き投稿の取得
+     */
+    private function get_prioritized_draft_posts($count) {
+        global $wpdb;
+        
+        // 複雑なソート条件を使用したカスタムクエリ
+        $query = "
+            SELECT 
+                p.ID,
+                p.post_title,
+                p.post_date,
+                deadline.meta_value as deadline_date,
+                amount.meta_value as max_amount_numeric,
+                (
+                    CASE 
+                        WHEN deadline.meta_value IS NOT NULL AND deadline.meta_value != '' 
+                        THEN 
+                            CASE 
+                                WHEN STR_TO_DATE(deadline.meta_value, '%Y%m%d') <= DATE_ADD(CURDATE(), INTERVAL 7 DAY) THEN 100
+                                WHEN STR_TO_DATE(deadline.meta_value, '%Y%m%d') <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 80
+                                WHEN STR_TO_DATE(deadline.meta_value, '%Y%m%d') <= DATE_ADD(CURDATE(), INTERVAL 90 DAY) THEN 60
+                                ELSE 40
+                            END
+                        ELSE 20
+                    END +
+                    CASE 
+                        WHEN CAST(amount.meta_value AS UNSIGNED) >= 10000000 THEN 30  -- 1000万円以上
+                        WHEN CAST(amount.meta_value AS UNSIGNED) >= 5000000 THEN 25   -- 500万円以上
+                        WHEN CAST(amount.meta_value AS UNSIGNED) >= 1000000 THEN 20   -- 100万円以上
+                        WHEN CAST(amount.meta_value AS UNSIGNED) >= 500000 THEN 15    -- 50万円以上
+                        ELSE 10
+                    END +
+                    CASE 
+                        WHEN p.post_date >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 15   -- 新しい投稿
+                        WHEN p.post_date >= DATE_SUB(NOW(), INTERVAL 30 DAY) THEN 10
+                        ELSE 5
+                    END
+                ) as priority_score,
+                DATE_FORMAT(STR_TO_DATE(deadline.meta_value, '%Y%m%d'), '%Y-%m-%d') as deadline
+            FROM {$wpdb->posts} p
+            LEFT JOIN {$wpdb->postmeta} deadline ON p.ID = deadline.post_id AND deadline.meta_key = 'deadline_date'
+            LEFT JOIN {$wpdb->postmeta} amount ON p.ID = amount.post_id AND amount.meta_key = 'max_amount_numeric'
+            WHERE p.post_type = 'grant' 
+            AND p.post_status = 'draft'
+            AND p.post_title != ''
+            ORDER BY priority_score DESC, 
+                     STR_TO_DATE(deadline.meta_value, '%Y%m%d') ASC,
+                     CAST(amount.meta_value AS UNSIGNED) DESC,
+                     p.post_date DESC
+            LIMIT %d
+        ";
+        
+        $results = $wpdb->get_results($wpdb->prepare($query, $count), ARRAY_A);
+        
+        $this->logger->log('優先順位付き下書き取得: ' . count($results) . '件取得（要求: ' . $count . '件）');
+        
+        // 取得したデータをログに記録
+        foreach ($results as $result) {
+            $this->logger->log("公開候補: ID={$result['ID']}, 優先度={$result['priority_score']}, 締切={$result['deadline']}, タイトル=" . substr($result['post_title'], 0, 30) . '...');
+        }
+        
+        return $results;
+    }
+    
+    /**
+     * 投稿の公開前検証
+     */
+    private function validate_post_for_publishing($post_id) {
+        $post = get_post($post_id);
+        if (!$post) {
+            return new WP_Error('invalid_post', '投稿が見つかりません');
+        }
+        
+        // タイトルの検証
+        if (empty(trim($post->post_title)) || strlen(trim($post->post_title)) < 5) {
+            return new WP_Error('invalid_title', 'タイトルが無効または短すぎます');
+        }
+        
+        // 本文の検証
+        if (empty(trim($post->post_content)) || strlen(trim($post->post_content)) < 100) {
+            return new WP_Error('invalid_content', '本文が無効または短すぎます');
+        }
+        
+        // 必要なカスタムフィールドの検証
+        $required_fields = array('jgrants_id', 'max_amount_numeric', 'deadline_date');
+        foreach ($required_fields as $field) {
+            $value = get_post_meta($post_id, $field, true);
+            if (empty($value)) {
+                return new WP_Error('missing_field', "必須フィールド '{$field}' が不足しています");
+            }
+        }
+        
+        // 締切日の検証
+        $deadline_date = get_post_meta($post_id, 'deadline_date', true);
+        if (!empty($deadline_date)) {
+            $deadline_timestamp = strtotime($deadline_date);
+            if ($deadline_timestamp && $deadline_timestamp < strtotime('-1 day')) {
+                return new WP_Error('expired_deadline', '募集締切が過ぎています (' . $deadline_date . ')');
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * 公開後のアクション
+     */
+    private function post_publish_actions($post_id) {
+        // 公開日時のメタデータを更新
+        update_post_meta($post_id, 'published_at', current_time('mysql'));
+        
+        // 公開ログの記録
+        $post = get_post($post_id);
+        $this->logger->log('投稿公開完了: ID=' . $post_id . ', タイトル=' . $post->post_title);
+        
+        // 必要に応じて他のアクション（通知、キャッシュクリア等）を追加
     }
     
     /**

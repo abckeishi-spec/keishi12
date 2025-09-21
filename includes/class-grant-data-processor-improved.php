@@ -68,42 +68,72 @@ class GIJI_Grant_Data_Processor {
     private function check_exclusion_criteria($subsidy_data) {
         $search_settings = get_option('giji_improved_search_settings', array());
         
-        // 補助額上限チェック
+        // 補助額上限の厳密なチェック
         if (isset($search_settings['exclude_zero_amount']) && $search_settings['exclude_zero_amount']) {
             if (isset($subsidy_data['subsidy_max_limit'])) {
-                $max_amount = $subsidy_data['subsidy_max_limit'];
-                if (empty($max_amount) || $max_amount === '0' || $max_amount === 0 || $max_amount === '未定') {
-                    return new WP_Error('invalid_amount', '補助額上限が0または不明な助成金です');
+                $max_amount_raw = $subsidy_data['subsidy_max_limit'];
+                $max_amount_numeric = $this->extract_numeric_amount($max_amount_raw);
+                
+                // 数値として0または抽出できない場合は除外
+                if ($max_amount_numeric <= 0) {
+                    return new WP_Error('invalid_amount', 
+                        '補助額上限が0または不明な助成金です (値: ' . $max_amount_raw . ')');
+                }
+                
+                // 極端に低い金額も除外（1万円未満）
+                if ($max_amount_numeric < 10000) {
+                    return new WP_Error('amount_too_low_minimum', 
+                        '補助額が最低基準（1万円）を下回っています (値: ' . $max_amount_numeric . '円)');
+                }
+            } else {
+                return new WP_Error('no_amount_data', '補助額上限の情報がありません');
+            }
+        }
+        
+        // 金額範囲チェック（改善版）
+        if (isset($subsidy_data['subsidy_max_limit'])) {
+            $amount_numeric = $this->extract_numeric_amount($subsidy_data['subsidy_max_limit']);
+            
+            // 最小金額チェック
+            if (isset($search_settings['min_amount']) && $search_settings['min_amount'] > 0) {
+                if ($amount_numeric < intval($search_settings['min_amount'])) {
+                    return new WP_Error('amount_too_low', 
+                        '最小金額条件を満たしていません (' . number_format($amount_numeric) . '円 < ' . 
+                        number_format($search_settings['min_amount']) . '円)');
+                }
+            }
+            
+            // 最大金額チェック
+            if (isset($search_settings['max_amount']) && $search_settings['max_amount'] > 0) {
+                if ($amount_numeric > intval($search_settings['max_amount'])) {
+                    return new WP_Error('amount_too_high', 
+                        '最大金額条件を超えています (' . number_format($amount_numeric) . '円 > ' . 
+                        number_format($search_settings['max_amount']) . '円)');
                 }
             }
         }
         
-        // 金額範囲チェック
-        if (isset($search_settings['min_amount']) && $search_settings['min_amount'] > 0) {
-            if (isset($subsidy_data['subsidy_max_limit'])) {
-                $amount = intval($subsidy_data['subsidy_max_limit']);
-                if ($amount < intval($search_settings['min_amount'])) {
-                    return new WP_Error('amount_too_low', '最小金額条件を満たしていません');
-                }
-            }
-        }
-        
-        if (isset($search_settings['max_amount']) && $search_settings['max_amount'] > 0) {
-            if (isset($subsidy_data['subsidy_max_limit'])) {
-                $amount = intval($subsidy_data['subsidy_max_limit']);
-                if ($amount > intval($search_settings['max_amount'])) {
-                    return new WP_Error('amount_too_high', '最大金額条件を超えています');
-                }
-            }
-        }
-        
-        // 募集状況チェック
+        // 募集状況チェック（改善版）
         if (isset($search_settings['acceptance_only']) && $search_settings['acceptance_only']) {
             if (isset($subsidy_data['acceptance_end_datetime'])) {
                 $end_date = strtotime($subsidy_data['acceptance_end_datetime']);
                 if ($end_date && $end_date < time()) {
-                    return new WP_Error('application_closed', '募集が終了している助成金です');
+                    return new WP_Error('application_closed', 
+                        '募集が終了している助成金です (締切: ' . date('Y-m-d', $end_date) . ')');
                 }
+            }
+        }
+        
+        // タイトルの有効性チェック
+        if (empty($subsidy_data['title']) || strlen(trim($subsidy_data['title'])) < 3) {
+            return new WP_Error('invalid_title', 'タイトルが無効または短すぎます');
+        }
+        
+        // 概要の有効性チェック
+        if (isset($subsidy_data['detail']) || isset($subsidy_data['overview'])) {
+            $overview = $subsidy_data['detail'] ?? $subsidy_data['overview'] ?? '';
+            if (empty($overview) || strlen(trim($overview)) < 10) {
+                return new WP_Error('invalid_overview', '概要が無効または短すぎます');
             }
         }
         
@@ -186,22 +216,61 @@ class GIJI_Grant_Data_Processor {
      * 金額の数値抽出（改善版）
      */
     private function extract_numeric_amount($amount_text) {
-        if (empty($amount_text) || $amount_text === '未定' || $amount_text === 'なし') {
+        if (empty($amount_text)) {
             return 0;
         }
         
-        // 数値のみを抽出
-        $amount_text = preg_replace('/[^\d]/', '', $amount_text);
-        $numeric_amount = intval($amount_text);
+        // 除外すべき文字列パターン（大文字小文字区別なし）
+        $invalid_patterns = array(
+            '未定', 'なし', '無し', 'なし', '不明', '未確定', '要相談', 
+            '応相談', '別途', '個別', 'tbd', 'tba', 'n/a', 'na', '-', 
+            '０', '0', '０円', '0円', '０万円', '0万円'
+        );
         
-        // 万円単位の検出
-        $original_text = strtolower($amount_text);
-        if (strpos($original_text, '万') !== false) {
-            $numeric_amount *= 10000;
-        } elseif (strpos($original_text, '億') !== false) {
+        $amount_lower = strtolower(trim($amount_text));
+        foreach ($invalid_patterns as $pattern) {
+            if (strpos($amount_lower, strtolower($pattern)) !== false) {
+                return 0;
+            }
+        }
+        
+        // 元のテキストを保存（単位検出用）
+        $original_text = $amount_text;
+        
+        // 数値のみを抽出（全角数字も対応）
+        $amount_text = mb_convert_kana($amount_text, 'n'); // 全角数字を半角に
+        preg_match_all('/\d+/', $amount_text, $matches);
+        
+        if (empty($matches[0])) {
+            return 0;
+        }
+        
+        // 最大の数値を取得（複数ある場合）
+        $numbers = array_map('intval', $matches[0]);
+        $numeric_amount = max($numbers);
+        
+        if ($numeric_amount <= 0) {
+            return 0;
+        }
+        
+        // 単位の検出（元テキストから）
+        $original_lower = strtolower($original_text);
+        
+        // 億円単位
+        if (strpos($original_lower, '億') !== false) {
             $numeric_amount *= 100000000;
-        } elseif (strpos($original_text, '千') !== false) {
+        }
+        // 万円単位
+        elseif (strpos($original_lower, '万') !== false) {
+            $numeric_amount *= 10000;
+        }
+        // 千円単位
+        elseif (strpos($original_lower, '千') !== false) {
             $numeric_amount *= 1000;
+        }
+        // 百万円単位
+        elseif (preg_match('/(\d+)百万/', $original_text, $matches)) {
+            $numeric_amount = intval($matches[1]) * 1000000;
         }
         
         return $numeric_amount;

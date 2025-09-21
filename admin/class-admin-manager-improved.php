@@ -640,6 +640,11 @@ class GIJI_Admin_Manager {
                 
                 <p class="submit">
                     <input type="submit" name="giji_improved_save_prompt_settings" class="button-primary" value="プロンプト設定を保存">
+                    <a href="<?php echo wp_nonce_url(admin_url('admin-post.php?action=giji_improved_update_prompts'), 'giji_improved_update_prompts'); ?>" 
+                       class="button button-secondary" 
+                       onclick="return confirm('改良プロンプト（HTML/CSS対応版）に更新しますか？既存のプロンプトは上書きされます。');">
+                        HTML/CSS対応改良プロンプトに更新
+                    </a>
                 </p>
             </form>
         </div>
