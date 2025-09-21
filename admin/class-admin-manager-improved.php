@@ -18,6 +18,14 @@ class GIJI_Admin_Manager {
         $this->logger = $logger;
         $this->security_manager = $security_manager;
         
+        // フックの登録を初期化時に実行
+        $this->init_hooks();
+    }
+    
+    /**
+     * フックの初期化
+     */
+    private function init_hooks() {
         // 管理画面フックの登録
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('admin_init', array($this, 'register_settings'));

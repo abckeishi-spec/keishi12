@@ -73,14 +73,14 @@ class Grant_Insight_JGrants_Importer_Improved {
         $this->load_dependencies();
         
         // WordPressの初期化が完了してからコンポーネントを初期化
-        add_action('init', array($this, 'init_components'));
+        add_action('wp_loaded', array($this, 'init_components'));
         
         // 改良プロンプト更新用のアクションフック
         add_action('admin_post_giji_improved_update_prompts', array($this, 'force_update_prompts'));
         
-        // 管理画面の初期化
+        // 管理画面の初期化（さらに遅らせる）
         if (is_admin()) {
-            add_action('admin_init', array($this, 'init_admin'));
+            add_action('wp_loaded', array($this, 'init_admin'));
         }
         
         // Cronスケジュールの追加

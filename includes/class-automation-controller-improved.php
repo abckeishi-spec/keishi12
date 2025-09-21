@@ -18,6 +18,14 @@ class GIJI_Automation_Controller {
         $this->data_processor = $data_processor;
         $this->logger = $logger;
         
+        // フックの登録を初期化時に実行
+        $this->init_hooks();
+    }
+    
+    /**
+     * フックの初期化
+     */
+    private function init_hooks() {
         // Cronフックの登録
         add_action(self::CRON_HOOK, array($this, 'execute_auto_import'));
     }
